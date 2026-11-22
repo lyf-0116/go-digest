@@ -50,6 +50,13 @@
 // writing is complete, calling the Verifier.Verified method will indicate
 // whether or not the stream of bytes matches the target digest.
 //
+// Verifier creation validates the digest and returns an error if the digest
+// format, encoding, or algorithm is invalid. A verification point may also
+// restrict the accepted algorithms by passing them to Digest.Verifier; this
+// avoids duplicating algorithm checks in each consumer of untrusted digests.
+// A mismatch reported by Verified therefore refers to the stream contents,
+// not to an invalid digest value.
+//
 // # Missing Features
 //
 // In addition to the above, we intend to add the following features to this

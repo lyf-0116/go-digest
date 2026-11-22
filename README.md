@@ -34,7 +34,10 @@ A `Verifier` type can be used to handle cases where an `io.Reader` makes more se
 
 ```go
 rd := getContent()
-verifier := id.Verifier()
+verifier, err := id.Verifier()
+if err != nil {
+  return err
+}
 io.Copy(verifier, rd)
 
 if !verifier.Verified() {

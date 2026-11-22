@@ -18,8 +18,8 @@ package digest
 import (
 	"bytes"
 	"crypto/rand"
+	"errors"
 	"io"
-	"reflect"
 	"testing"
 )
 
@@ -31,7 +31,10 @@ func TestDigestVerifier(t *testing.T) {
 	}
 	digest := FromBytes(p)
 
-	verifier := digest.Verifier()
+	verifier, err := digest.Verifier()
+	if err != nil {
+		t.Fatalf("unexpected error creating verifier: %v", err)
+	}
 
 	_, err = io.Copy(verifier, bytes.NewReader(p))
 	if err != nil {
@@ -43,45 +46,89 @@ func TestDigestVerifier(t *testing.T) {
 	}
 }
 
-// TestVerifierUnsupportedDigest ensures that unsupported digest validation is
-// flowing through verifier creation.
+// TestVerifierUnsupportedDigest ensures that digest validation is flowing
+// through verifier creation.
 func TestVerifierUnsupportedDigest(t *testing.T) {
 	for _, testcase := range []struct {
 		Name     string
 		Digest   Digest
-		Expected interface{} // expected panic target
+		Expected error
 	}{
 		{
 			Name:     "Empty",
 			Digest:   "",
-			Expected: "no ':' separator in digest \"\"",
+			Expected: ErrDigestInvalidFormat,
 		},
 		{
 			Name:     "EmptyAlg",
 			Digest:   ":",
-			Expected: "empty digest algorithm, validate before calling Algorithm.Hash()",
+			Expected: ErrDigestInvalidFormat,
 		},
 		{
 			Name:     "Unsupported",
 			Digest:   Digest("bean:0123456789abcdef"),
-			Expected: "bean not available (make sure it is imported)",
+			Expected: ErrDigestUnsupported,
 		},
 		{
 			Name:     "Garbage",
 			Digest:   Digest("sha256-garbage:pure"),
-			Expected: "sha256-garbage not available (make sure it is imported)",
+			Expected: ErrDigestUnsupported,
+		},
+		{
+			Name:     "InvalidEncoding",
+			Digest:   Digest("sha256:pure"),
+			Expected: ErrDigestInvalidLength,
+		},
+		{
+			Name:     "UppercaseHex",
+			Digest:   Digest("sha256:E58FCF7418D4390DEC8E8FB69D88C06EC07039D651FEDD3AA72AF9972E7D046B"),
+			Expected: ErrDigestInvalidFormat,
 		},
 	} {
 		t.Run(testcase.Name, func(t *testing.T) {
-			expected := testcase.Expected
-			defer func() {
-				recovered := recover()
-				if !reflect.DeepEqual(recovered, expected) {
-					t.Fatalf("unexpected recover: %v != %v", recovered, expected)
-				}
-			}()
-
-			_ = testcase.Digest.Verifier()
+			verifier, err := testcase.Digest.Verifier()
+			if !errors.Is(err, testcase.Expected) {
+				t.Fatalf("unexpected error: %v != %v", err, testcase.Expected)
+			}
+			if verifier != nil {
+				t.Fatalf("unexpected verifier for invalid digest %q", testcase.Digest)
+			}
 		})
 	}
+}
+
+func TestVerifierAlgorithmPolicy(t *testing.T) {
+	digest := FromString("hello")
+	verifier, err := digest.Verifier(SHA256, SHA512)
+	if err != nil {
+		t.Fatalf("unexpected error creating verifier: %v", err)
+	}
+	if _, err := io.Copy(verifier, bytes.NewBufferString("hello")); err != nil {
+		t.Fatal(err)
+	}
+	if !verifier.Verified() {
+		t.Fatal("bytes not verified")
+	}
+
+	if _, err := digest.Verifier(SHA512); !errors.Is(err, ErrDigestUnsupported) {
+		t.Fatalf("unexpected error for disallowed algorithm: %v", err)
+	}
+}
+
+func TestMustVerifier(t *testing.T) {
+	digest := FromString("hello")
+	verifier := digest.MustVerifier()
+	if _, err := io.Copy(verifier, bytes.NewBufferString("hello")); err != nil {
+		t.Fatal(err)
+	}
+	if !verifier.Verified() {
+		t.Fatal("bytes not verified")
+	}
+
+	defer func() {
+		if recovered := recover(); recovered == nil {
+			t.Fatal("expected panic for invalid digest")
+		}
+	}()
+	_ = Digest("sha256:pure").MustVerifier()
 }

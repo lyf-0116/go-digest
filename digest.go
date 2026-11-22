@@ -129,12 +129,50 @@ func (d Digest) Algorithm() Algorithm {
 }
 
 // Verifier returns a writer object that can be used to verify a stream of
-// content against the digest. If the digest is invalid, the method will panic.
-func (d Digest) Verifier() Verifier {
-	return hashVerifier{
-		hash:   d.Algorithm().Hash(),
-		digest: d,
+// content against the digest.
+//
+// The digest is fully validated before a verifier is returned, so an invalid
+// digest is reported as an error instead of producing a verifier which always
+// reports a mismatch after the stream has been written.
+//
+// If algorithms is non-empty, it is the set of algorithms accepted at this
+// verification point. A valid digest using any other algorithm is rejected
+// with ErrDigestUnsupported. If algorithms is empty, any registered algorithm
+// is accepted.
+func (d Digest) Verifier(algorithms ...Algorithm) (Verifier, error) {
+	if err := d.Validate(); err != nil {
+		return nil, err
 	}
+
+	alg := d.Algorithm()
+	if len(algorithms) > 0 {
+		allowed := false
+		for _, candidate := range algorithms {
+			if candidate == alg {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return nil, ErrDigestUnsupported
+		}
+	}
+
+	return hashVerifier{
+		hash:   alg.Hash(),
+		digest: d,
+	}, nil
+}
+
+// MustVerifier is like [Digest.Verifier], but panics if the digest is invalid
+// or its algorithm is not allowed. It is intended for trusted digests where
+// the failure is a programming error.
+func (d Digest) MustVerifier(algorithms ...Algorithm) Verifier {
+	v, err := d.Verifier(algorithms...)
+	if err != nil {
+		panic(err)
+	}
+	return v
 }
 
 // Encoded returns the encoded portion of the digest. It panics if the

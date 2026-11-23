@@ -77,10 +77,37 @@ func checkShortMatch(alg digest.Algorithm, hex, shortAlg, shortHex string) bool 
 	return true
 }
 
+// validateSyntax checks that d is a syntactically valid digest. Unlike
+// digest.Digest.Validate, it does not require the digest's algorithm to be
+// registered with this process: a well-formed digest that this process
+// cannot compute (digest.ErrDigestUnsupported) is still a valid entry key,
+// so that a set can hold, and round-trip, digests produced by other
+// processes.
+func validateSyntax(d digest.Digest) error {
+	if err := d.Validate(); err != nil && !errors.Is(err, digest.ErrDigestUnsupported) {
+		return err
+	}
+	return nil
+}
+
+// compareEntries compares two entries by their sort key: the encoded value
+// first, then the algorithm. It returns a negative number, zero, or a
+// positive number when a sorts before, equal to, or after b.
+func compareEntries(a, b *digestEntry) int {
+	if c := strings.Compare(a.val, b.val); c != 0 {
+		return c
+	}
+	return strings.Compare(string(a.alg), string(b.alg))
+}
+
 // Lookup looks for a digest matching the given string representation.
 // If no digests could be found ErrDigestNotFound will be returned
 // with an empty digest value. If multiple matches are found
 // ErrDigestAmbiguous will be returned with an empty digest value.
+//
+// Whether this process can compute the digest's algorithm is irrelevant:
+// entries are matched by their string key, so digests whose algorithm is
+// not registered (digest.ErrDigestUnsupported) are found like any other.
 func (dst *Set) Lookup(d string) (digest.Digest, error) {
 	dst.mutex.RLock()
 	defer dst.mutex.RUnlock()
@@ -93,20 +120,28 @@ func (dst *Set) Lookup(d string) (digest.Digest, error) {
 		hex        string
 	)
 	dgst, err := digest.Parse(d)
-	if errors.Is(err, digest.ErrDigestInvalidFormat) {
+	switch {
+	case errors.Is(err, digest.ErrDigestInvalidFormat):
+		// d is not an algorithm-qualified digest: match it against the
+		// encoded values as an unqualified prefix.
 		hex = d
 		searchFunc = func(i int) bool {
 			return dst.entries[i].val >= d
 		}
-	} else {
+	case err == nil || errors.Is(err, digest.ErrDigestUnsupported) || errors.Is(err, digest.ErrDigestInvalidLength):
+		// d is algorithm-qualified: a full digest (nil), a qualified short
+		// code (digest.ErrDigestInvalidLength), or a well-formed digest
+		// whose algorithm this process cannot compute
+		// (digest.ErrDigestUnsupported). All three are looked up by their
+		// string key in the same way.
 		hex = dgst.Encoded()
 		alg = dgst.Algorithm()
+		key := &digestEntry{alg: alg, val: hex}
 		searchFunc = func(i int) bool {
-			if dst.entries[i].val == hex {
-				return dst.entries[i].alg >= alg
-			}
-			return dst.entries[i].val >= hex
+			return compareEntries(dst.entries[i], key) >= 0
 		}
+	default:
+		return "", err
 	}
 	idx := sort.Search(len(dst.entries), searchFunc)
 
@@ -135,23 +170,21 @@ func (dst *Set) Lookup(d string) (digest.Digest, error) {
 	return match.digest, nil
 }
 
-// Add adds the given digest to the set. An error will be returned
-// if the given digest is invalid. If the digest already exists in the
-// set, this operation will be a no-op.
+// Add adds the given digest to the set. An error will be returned if the
+// given digest is not syntactically valid. A well-formed digest whose
+// algorithm is not registered with this process (digest.ErrDigestUnsupported)
+// is accepted: computability is not required to store a digest. If the
+// digest already exists in the set, this operation will be a no-op.
 func (dst *Set) Add(d digest.Digest) error {
-	if err := d.Validate(); err != nil {
+	if err := validateSyntax(d); err != nil {
 		return err
 	}
 	dst.mutex.Lock()
 	defer dst.mutex.Unlock()
 	entry := &digestEntry{alg: d.Algorithm(), val: d.Encoded(), digest: d}
-	searchFunc := func(i int) bool {
-		if dst.entries[i].val == entry.val {
-			return dst.entries[i].alg >= entry.alg
-		}
-		return dst.entries[i].val >= entry.val
-	}
-	idx := sort.Search(len(dst.entries), searchFunc)
+	idx := sort.Search(len(dst.entries), func(i int) bool {
+		return compareEntries(dst.entries[i], entry) >= 0
+	})
 	if idx == len(dst.entries) {
 		dst.entries = append(dst.entries, entry)
 		return nil
@@ -166,23 +199,20 @@ func (dst *Set) Add(d digest.Digest) error {
 	return nil
 }
 
-// Remove removes the given digest from the set. An err will be
-// returned if the given digest is invalid. If the digest does
-// not exist in the set, this operation will be a no-op.
+// Remove removes the given digest from the set. An error will be returned
+// if the given digest is not syntactically valid. As with Add, a well-formed
+// digest whose algorithm is not registered with this process is accepted.
+// If the digest does not exist in the set, this operation will be a no-op.
 func (dst *Set) Remove(d digest.Digest) error {
-	if err := d.Validate(); err != nil {
+	if err := validateSyntax(d); err != nil {
 		return err
 	}
 	dst.mutex.Lock()
 	defer dst.mutex.Unlock()
 	entry := &digestEntry{alg: d.Algorithm(), val: d.Encoded(), digest: d}
-	searchFunc := func(i int) bool {
-		if dst.entries[i].val == entry.val {
-			return dst.entries[i].alg >= entry.alg
-		}
-		return dst.entries[i].val >= entry.val
-	}
-	idx := sort.Search(len(dst.entries), searchFunc)
+	idx := sort.Search(len(dst.entries), func(i int) bool {
+		return compareEntries(dst.entries[i], entry) >= 0
+	})
 	// Not found if idx is after or value at idx is not digest
 	if idx == len(dst.entries) || dst.entries[idx].digest != d {
 		return nil
@@ -264,10 +294,7 @@ func (d digestEntries) Len() int {
 }
 
 func (d digestEntries) Less(i, j int) bool {
-	if d[i].val != d[j].val {
-		return d[i].val < d[j].val
-	}
-	return d[i].alg < d[j].alg
+	return compareEntries(d[i], d[j]) < 0
 }
 
 func (d digestEntries) Swap(i, j int) {

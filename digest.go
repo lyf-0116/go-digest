@@ -46,19 +46,48 @@ func NewDigest(alg Algorithm, h hash.Hash) Digest {
 // Typically, this can come from hash.Hash.Sum(...) or xxx.SumXXX(...)
 // functions. This is also useful for rebuilding digests from binary
 // serializations.
+//
+// It panics if alg is not [Algorithm.Available] or if p does not have the
+// output size the registered hash reports, since either case would produce a
+// [Digest] that fails its own [Digest.Validate].
 func NewDigestFromBytes(alg Algorithm, p []byte) Digest {
-	return Digest(string(alg) + ":" + alg.Encode(p))
+	binding := alg.lookup()
+	if binding == nil {
+		panic(fmt.Sprintf("%v not available (make sure it is imported)", alg))
+	}
+	if len(p) != binding.size {
+		panic(fmt.Sprintf("%s digest requires %d bytes, got %d", alg, binding.size, len(p)))
+	}
+	return newDigestFromEncoded(alg, binding.encode(p))
 }
 
 // NewDigestFromHex returns a Digest from alg and the hex encoded digest.
 //
 // Deprecated: use [NewDigestFromEncoded] instead.
 func NewDigestFromHex(alg, hex string) Digest {
-	return Digest(alg + ":" + hex)
+	return NewDigestFromEncoded(Algorithm(alg), hex)
 }
 
 // NewDigestFromEncoded returns a Digest from alg and the encoded digest.
+//
+// It panics if alg is not [Algorithm.Available] or if encoded is not a valid,
+// correctly sized encoding of the registered hash, since the returned
+// [Digest] is guaranteed to be in a format that passes [Digest.Validate].
 func NewDigestFromEncoded(alg Algorithm, encoded string) Digest {
+	binding := alg.lookup()
+	if binding == nil {
+		panic(fmt.Sprintf("%v not available (make sure it is imported)", alg))
+	}
+	return newDigestFromEncoded(alg, encoded)
+}
+
+// newDigestFromEncoded builds the canonical digest string and enforces the
+// format invariant shared by every construction entry point. The caller must
+// have resolved the immutable binding for alg.
+func newDigestFromEncoded(alg Algorithm, encoded string) Digest {
+	if err := alg.Validate(encoded); err != nil {
+		panic(fmt.Sprintf("invalid %s digest %q: %v", alg, encoded, err))
+	}
 	return Digest(string(alg) + ":" + encoded)
 }
 

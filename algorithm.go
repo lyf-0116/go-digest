@@ -21,6 +21,7 @@ import (
 	_ "crypto/sha256"
 	// make sure crypto.sha512 and crypto.SHA384 are registered
 	_ "crypto/sha512"
+	"encoding/hex"
 	"fmt"
 	"hash"
 	"io"
@@ -132,12 +133,26 @@ type CryptoHash interface {
 	New() hash.Hash
 }
 
+// cryptoHash is the immutable binding of a hash implementation to the size of
+// its output and its encoding, captured once at registration time. Every
+// digest construction and validation path goes through this binding so that a
+// [Digest] produced by this package can never disagree about its own length or
+// encoding with the digest the same package accepts.
+type cryptoHash struct {
+	// CryptoHash is the registered hash implementation.
+	CryptoHash
+	// size is the frozen output length, in bytes, of the hash implementation.
+	size int
+	// encode renders the raw hash bytes into the encoded portion of a digest.
+	encode func([]byte) string
+}
+
 var (
 	// algorithms maps values to CryptoHash implementations. Other algorithms
 	// may be available but they cannot be calculated by the digest package.
 	//
 	// See: RegisterAlgorithm
-	algorithms = map[Algorithm]CryptoHash{}
+	algorithms = map[Algorithm]*cryptoHash{}
 
 	// algorithmsLock protects [algorithms].
 	algorithmsLock sync.RWMutex
@@ -163,8 +178,25 @@ func RegisterAlgorithm(algorithm Algorithm, implementation CryptoHash) bool {
 		panic(fmt.Sprintf("Algorithm %s has a name which does not fit within the allowed grammar", algorithm))
 	}
 
-	algorithms[algorithm] = implementation
+	// Freeze the implementation together with its output size and encoding at
+	// registration time. The resulting binding is never mutated, so digest
+	// construction and validation always observe the same dimensions.
+	algorithms[algorithm] = &cryptoHash{
+		CryptoHash: implementation,
+		size:       implementation.Size(),
+		encode:     hex.EncodeToString,
+	}
 	return true
+}
+
+// lookup returns the immutable binding registered for a, or nil if the
+// algorithm is not registered. The read lock is only held while accessing the
+// registry; the returned binding can be used without holding the lock because
+// it is never mutated after registration.
+func (a Algorithm) lookup() *cryptoHash {
+	algorithmsLock.RLock()
+	defer algorithmsLock.RUnlock()
+	return algorithms[a]
 }
 
 // isLowerHex reports whether s only contains lowercase hexadecimal digits.
@@ -183,11 +215,8 @@ func isLowerHex(s string) bool {
 // Available returns true if the digest type is available for use. If this
 // returns false, Digester and Hash will return nil.
 func (a Algorithm) Available() bool {
-	algorithmsLock.RLock()
-	defer algorithmsLock.RUnlock()
-
-	h, ok := algorithms[a]
-	if !ok {
+	h := a.lookup()
+	if h == nil {
 		return false
 	}
 
@@ -201,14 +230,11 @@ func (a Algorithm) String() string {
 
 // Size returns number of bytes returned by the hash.
 func (a Algorithm) Size() int {
-	algorithmsLock.RLock()
-	defer algorithmsLock.RUnlock()
-
-	h, ok := algorithms[a]
-	if !ok {
+	h := a.lookup()
+	if h == nil {
 		return 0
 	}
-	return h.Size()
+	return h.size
 }
 
 // Set implemented to allow use of Algorithm as a command line flag.
@@ -256,9 +282,7 @@ func (a Algorithm) Hash() hash.Hash {
 		panic(fmt.Sprintf("%v not available (make sure it is imported)", a))
 	}
 
-	algorithmsLock.RLock()
-	defer algorithmsLock.RUnlock()
-	return algorithms[a].New()
+	return a.lookup().New()
 }
 
 // Encode encodes the raw bytes of a digest, typically from a hash.Hash, into
@@ -269,7 +293,7 @@ func (a Algorithm) Encode(d []byte) string {
 	//
 	// We support dynamic registration now, but we do not allow for the user to
 	// specify their own custom format. Hash functions may only use hex encoding.
-	return fmt.Sprintf("%x", d)
+	return a.lookup().encode(d)
 }
 
 // FromReader returns the digest of the reader using the algorithm.
@@ -304,16 +328,13 @@ func (a Algorithm) FromString(s string) Digest {
 
 // Validate validates the encoded portion string
 func (a Algorithm) Validate(encoded string) error {
-	algorithmsLock.RLock()
-	defer algorithmsLock.RUnlock()
-
-	h, ok := algorithms[a]
-	if !ok {
+	h := a.lookup()
+	if h == nil {
 		return ErrDigestUnsupported
 	}
 	// Digests much always be hex-encoded, ensuring that their hex portion will
 	// always be size*2
-	if h.Size()*2 != len(encoded) {
+	if h.size*2 != len(encoded) {
 		return ErrDigestInvalidLength
 	}
 	// We can do this since [Algorithm.Encode] only implements a hex digest.

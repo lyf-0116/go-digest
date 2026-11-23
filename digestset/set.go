@@ -142,6 +142,10 @@ func (dst *Set) Add(d digest.Digest) error {
 	if err := d.Validate(); err != nil {
 		return err
 	}
+	// Rebuild the digest through the registered binding so that both the
+	// stored value and its sort key are derived from the canonical, invariant
+	// preserving representation rather than from the raw input string.
+	d = digest.NewDigestFromEncoded(d.Algorithm(), d.Encoded())
 	dst.mutex.Lock()
 	defer dst.mutex.Unlock()
 	entry := &digestEntry{alg: d.Algorithm(), val: d.Encoded(), digest: d}
@@ -173,6 +177,9 @@ func (dst *Set) Remove(d digest.Digest) error {
 	if err := d.Validate(); err != nil {
 		return err
 	}
+	// Canonicalize through the registered binding so removal matches the key
+	// used when the digest was added.
+	d = digest.NewDigestFromEncoded(d.Algorithm(), d.Encoded())
 	dst.mutex.Lock()
 	defer dst.mutex.Unlock()
 	entry := &digestEntry{alg: d.Algorithm(), val: d.Encoded(), digest: d}

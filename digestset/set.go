@@ -213,42 +213,111 @@ func (dst *Set) All() []digest.Digest {
 // entire value of digest if uniqueness cannot be achieved without the
 // full value. This function will attempt to make short codes as short
 // as possible to be unique.
+//
+// Entries sharing a hex prefix form a prefix cluster. Each cluster owns
+// its own state: the index of its first entry, the current short code
+// width, and whether the width has stabilized. Width only grows within a
+// cluster and resets to the requested minimum length when the next
+// cluster starts, so one cluster can never widen another. Collisions are
+// detected per algorithm: entries with a different algorithm and the same
+// hex prefix do not widen the cluster, they are disambiguated with their
+// fully qualified digest string instead. Every returned short code can be
+// resolved back to its digest through Lookup.
 func ShortCodeTable(dst *Set, length int) map[digest.Digest]string {
 	dst.mutex.RLock()
 	defer dst.mutex.RUnlock()
 	m := make(map[digest.Digest]string, len(dst.entries))
-	l := length
-	resetIdx := 0
+
+	// Cluster-local state. The previous implementation kept the width and a
+	// rollback index as variables shared across the whole table, so one
+	// collision could widen unrelated clusters, and entries processed after
+	// the last affected index never saw the reset width.
+	clusterStart := 0
+	clusterWidth := length
+	stabilized := false
+
 	for i := 0; i < len(dst.entries); i++ {
-		var short string
-		extended := true
-		for extended {
-			extended = false
-			if len(dst.entries[i].val) <= l {
-				short = dst.entries[i].digest.String()
-			} else {
-				short = dst.entries[i].val[:l]
-				for j := i + 1; j < len(dst.entries); j++ {
-					if checkShortMatch(dst.entries[j].alg, dst.entries[j].val, "", short) {
-						if j > resetIdx {
-							resetIdx = j
-						}
-						extended = true
-					} else {
-						break
-					}
-				}
-				if extended {
-					l++
-				}
+		entry := dst.entries[i]
+
+		// Cluster boundaries are defined by the prefix at the requested
+		// minimum length, never by the grown width: otherwise a widened
+		// cluster would split itself in two and reset the width while later
+		// entries still collide at the minimum length.
+		baseWidth := length
+		if len(dst.entries[clusterStart].val) < baseWidth {
+			baseWidth = len(dst.entries[clusterStart].val)
+		}
+		if i > clusterStart && !strings.HasPrefix(entry.val, dst.entries[clusterStart].val[:baseWidth]) {
+			clusterStart = i
+			clusterWidth = length
+			stabilized = false
+		}
+
+		// Grow the cluster width until no later entry of the same algorithm
+		// shares the prefix. Once an entry needs no further widening the
+		// cluster has stabilized and later entries reuse the same width.
+		short := ""
+		for {
+			if len(entry.val) <= clusterWidth {
+				short = entry.digest.String()
+				stabilized = true
+				break
 			}
+			short = entry.val[:clusterWidth]
+
+			collides, differentAlgorithm := clusterConflicts(dst.entries, i, clusterStart, short, entry.alg)
+
+			if collides {
+				if stabilized {
+					// A collision after stabilization means the width grew
+					// for an earlier entry only; widen again and resume.
+					stabilized = false
+				}
+				clusterWidth++
+				continue
+			}
+
+			stabilized = true
+			if differentAlgorithm {
+				// A bare hex prefix cannot be resolved across algorithms;
+				// the fully qualified digest stays unambiguous in Lookup.
+				short = entry.digest.String()
+			}
+			break
 		}
-		m[dst.entries[i].digest] = short
-		if i >= resetIdx {
-			l = length
-		}
+		m[entry.digest] = short
 	}
 	return m
+}
+
+// clusterConflicts inspects every entry sharing the prefix short within the
+// current cluster, in both directions around i. It reports whether any of
+// them uses the same algorithm (which requires a wider short code) and
+// whether at least one of them uses a different algorithm (which makes the
+// bare hex prefix unresolvable even though it must not widen the cluster).
+func clusterConflicts(entries digestEntries, i, clusterStart int, short string, alg digest.Algorithm) (sameAlgorithm, differentAlgorithm bool) {
+	for j := i + 1; j < len(entries) && strings.HasPrefix(entries[j].val, short); j++ {
+		if entries[j].alg == alg {
+			sameAlgorithm = true
+		} else {
+			differentAlgorithm = true
+		}
+	}
+	for j := i - 1; j >= clusterStart; j-- {
+		if len(entries[j].val) < len(short) {
+			if !strings.HasPrefix(short, entries[j].val) {
+				break
+			}
+		} else if !strings.HasPrefix(entries[j].val, short) {
+			break
+		}
+		if entries[j].alg == alg {
+			sameAlgorithm = true
+		} else {
+			differentAlgorithm = true
+		}
+	}
+	return sameAlgorithm, differentAlgorithm
 }
 
 type digestEntry struct {

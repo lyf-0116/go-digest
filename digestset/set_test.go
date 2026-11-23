@@ -247,6 +247,119 @@ func TestShortCodeTable(t *testing.T) {
 	assertEqualShort(t, dump[digests[7]], "653")
 }
 
+// TestShortCodeTableDifferentAlgorithms verifies that entries with the same
+// hex prefix but different algorithms do not widen each other: hex prefixes
+// cannot disambiguate algorithms, so both entries fall back to their fully
+// qualified digest strings while unrelated clusters keep the minimum width.
+func TestShortCodeTableDifferentAlgorithms(t *testing.T) {
+	samePrefixA := digest.Digest("sha256:1234" + strings.Repeat("0", 60))
+	samePrefixB := digest.Digest("sha512:1234" + strings.Repeat("0", 124))
+	other := digest.Digest("sha256:5678" + strings.Repeat("1", 60))
+
+	dset := NewSet()
+	for _, d := range []digest.Digest{samePrefixA, samePrefixB, other} {
+		if err := dset.Add(d); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	dump := ShortCodeTable(dset, 2)
+	assertEqualShort(t, dump[samePrefixA], string(samePrefixA))
+	assertEqualShort(t, dump[samePrefixB], string(samePrefixB))
+	assertEqualShort(t, dump[other], "56")
+
+	for _, d := range []digest.Digest{samePrefixA, samePrefixB, other} {
+		got, err := dset.Lookup(dump[d])
+		if err != nil {
+			t.Fatalf("Lookup(%q) returned error: %v", dump[d], err)
+		}
+		if got != d {
+			t.Fatalf("Lookup(%q) = %s; want %s", dump[d], got, d)
+		}
+	}
+}
+
+// TestShortCodeTableClusterReset verifies that the width is local to a
+// prefix cluster: a later entry in a widened cluster reuses the grown
+// width instead of the minimum width, and a new cluster starts again at
+// the minimum width.
+func TestShortCodeTableClusterReset(t *testing.T) {
+	clusterA1 := digest.Digest("sha256:12341" + strings.Repeat("0", 59))
+	clusterA2 := digest.Digest("sha256:12345" + strings.Repeat("0", 59))
+	clusterA3 := digest.Digest("sha256:12349" + strings.Repeat("0", 59))
+	clusterB := digest.Digest("sha256:9876" + strings.Repeat("2", 60))
+
+	dset := NewSet()
+	for _, d := range []digest.Digest{clusterA1, clusterA2, clusterA3, clusterB} {
+		if err := dset.Add(d); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	dump := ShortCodeTable(dset, 2)
+	assertEqualShort(t, dump[clusterA1], "12341")
+	assertEqualShort(t, dump[clusterA2], "12345")
+	assertEqualShort(t, dump[clusterA3], "12349")
+	assertEqualShort(t, dump[clusterB], "98")
+
+	for _, d := range []digest.Digest{clusterA1, clusterA2, clusterA3, clusterB} {
+		got, err := dset.Lookup(dump[d])
+		if err != nil {
+			t.Fatalf("Lookup(%q) returned error: %v", dump[d], err)
+		}
+		if got != d {
+			t.Fatalf("Lookup(%q) = %s; want %s", dump[d], got, d)
+		}
+	}
+}
+
+// TestShortCodeTableReverseLookup exercises randomized sets, including
+// multiple algorithms, and asserts that every generated short code is
+// unique and resolves back to exactly its original digest.
+func TestShortCodeTableReverseLookup(t *testing.T) {
+	r := rand.New(rand.NewSource(99173))
+	algorithms := []digest.Algorithm{digest.SHA256, digest.SHA512}
+
+	for trial := 0; trial < 20; trial++ {
+		dset := NewSet()
+		expected := map[digest.Digest]struct{}{}
+		for n := 0; n < 50; n++ {
+			alg := algorithms[r.Intn(len(algorithms))]
+			size := alg.Size()
+			encoded := make([]byte, size*2)
+			for i := range encoded {
+				encoded[i] = "0123456789abcdef"[r.Intn(16)]
+			}
+			d := digest.NewDigestFromEncoded(alg, string(encoded))
+			if err := dset.Add(d); err != nil {
+				t.Fatal(err)
+			}
+			expected[d] = struct{}{}
+		}
+
+		dump := ShortCodeTable(dset, 2)
+		if len(dump) != len(expected) {
+			t.Fatalf("trial %d: table size %d, want %d", trial, len(dump), len(expected))
+		}
+
+		seen := map[string]digest.Digest{}
+		for d, short := range dump {
+			if previous, ok := seen[short]; ok {
+				t.Fatalf("trial %d: duplicate short code %q for %s and %s", trial, short, previous, d)
+			}
+			seen[short] = d
+
+			got, err := dset.Lookup(short)
+			if err != nil {
+				t.Fatalf("trial %d: Lookup(%q) returned error: %v", trial, short, err)
+			}
+			if got != d {
+				t.Fatalf("trial %d: Lookup(%q) = %s; want %s", trial, short, got, d)
+			}
+		}
+	}
+}
+
 func createDigests(count int) ([]digest.Digest, error) {
 	r := rand.New(rand.NewSource(25823))
 	digests := make([]digest.Digest, count)
